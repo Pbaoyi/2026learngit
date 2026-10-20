@@ -14,7 +14,7 @@ def path(filename):
     return os.path.join(SAVE_DIR, filename)
 
 # ========== 1. 配置 ==========
-KEY = "36bb53434260cefe7683a768ebc36962"   # 你的Key
+KEY = ""   # 你的Key
 URL = "https://restapi.amap.com/v3/place/text"
 CITY = "杭州"
 KEYWORDS = "大学"
