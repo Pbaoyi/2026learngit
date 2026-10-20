@@ -9,7 +9,7 @@ plt.rcParams['font.sans-serif'] = ['SimHei', 'Microsoft YaHei', 'Arial Unicode M
 plt.rcParams['axes.unicode_minus'] = False 
 
 # %%
-API_KEY = "8c4ee3c7c3bf7985a786b7a491304991"
+API_KEY = "YOUR_AMAP_API_KEY"  # 替换为你的高德地图 API Key
 BASE_URL = 'https://restapi.amap.com/v5/place/text'
 
 # %%
