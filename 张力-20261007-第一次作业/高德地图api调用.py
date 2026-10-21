@@ -1,11 +1,18 @@
 # -*- coding: utf-8 -*-
 """
-调用高德地图 POI 搜索 API（仿照 api_request_example.py 的写法）
+调用高德地图 POI 搜索 API
 
 使用前：
   1. 到高德开放平台 https://lbs.amap.com 注册并创建「Web服务」类型的 Key
-  2. 把下面的 API_KEY 替换成你自己的 Key
+  2. 通过环境变量 AMAP_API_KEY 提供 Key（不要写进代码，防止泄露）：
+       Windows CMD:   set AMAP_API_KEY=你的Key
+       PowerShell:    $env:AMAP_API_KEY="你的Key"
   3. 修改下方的搜索关键词和城市
+
+坐标系说明：
+  高德 Web 服务 API 返回的 location 字段是 GCJ-02（火星坐标），直接叠加
+  OpenStreetMap / EPSG:4326 会有数百米偏移（南京实测约 540 m）。
+  本程序提取坐标时已用纯算法纠偏为 WGS-84（见 1.5 节），无需额外处理。
 
 依赖：
   pip install requests pandas
@@ -15,12 +22,12 @@
 import os
 import sys
 import time
+import math
 import requests
 import pandas as pd
 import matplotlib.pyplot as plt
 import geopandas as gpd
 from shapely.geometry import Point
-from pprint import pprint
 
 # 让 Windows 控制台能正确输出 ✓/✗/中文（避免 GBK 编码报错）
 sys.stdout.reconfigure(encoding="utf-8")
@@ -31,7 +38,11 @@ plt.rcParams["axes.unicode_minus"] = False
 
 # ============ 1. 配置区（按需修改） ============
 
-API_KEY = "e076780c454b0c98d57a27ff820707e0"      # ← 改成你自己的 Key
+# API Key 不写死在代码里，改用环境变量提供，避免提交到 Git 后泄露：
+#   Windows CMD:   set AMAP_API_KEY=你的Key
+#   PowerShell:    $env:AMAP_API_KEY="你的Key"
+# ⚠ 旧 Key 曾随本文件提交到 Git 历史，请在开放平台重置后使用新 Key
+API_KEY = os.environ.get("AMAP_API_KEY", "你的高德地图Key")
 BASE_URL = "https://restapi.amap.com/v5/place/text"
 
 KEYWORDS = ["大学", "地铁站", "博物馆", "电影院"]   # 要搜索的 POI 类型
@@ -44,6 +55,89 @@ COLORS = {kw: COLOR_PALETTE[i % len(COLOR_PALETTE)] for i, kw in enumerate(KEYWO
 
 # 重点分析对象（第 4.3 节分页搜索 + 第 7 节深入分析）
 FOCUS_POI = KEYWORDS[0]
+
+
+# ============ 1.5 坐标系转换：GCJ-02 → WGS-84 ============
+#
+# 高德地图 API 返回的是 GCJ-02（国测局加密坐标，俗称「火星坐标」）。
+# 下面是标准的 GCJ-02 ↔ WGS-84 互转算法（纯 Python，无需联网、不消耗 API 配额）。
+# 参数说明：6378245.0 为克拉索夫斯基 1940 椭球长半轴，
+#           0.00669342162296594323 为其第一偏心率平方 e²。
+
+def _out_of_china(lng, lat):
+    """中国境外没有 GCJ-02 加密偏移，直接返回原值"""
+    return not (73.66 < lng < 135.05 and 3.86 < lat < 53.55)
+
+
+def _transform_lat(x, y):
+    ret = -100.0 + 2.0 * x + 3.0 * y + 0.2 * y * y + 0.1 * x * y + 0.2 * math.sqrt(abs(x))
+    ret += (20.0 * math.sin(6.0 * x * math.pi) + 20.0 * math.sin(2.0 * x * math.pi)) * 2.0 / 3.0
+    ret += (20.0 * math.sin(y * math.pi) + 40.0 * math.sin(y / 3.0 * math.pi)) * 2.0 / 3.0
+    ret += (160.0 * math.sin(y / 12.0 * math.pi) + 320.0 * math.sin(y * math.pi / 30.0)) * 2.0 / 3.0
+    return ret
+
+
+def _transform_lon(x, y):
+    ret = 300.0 + x + 2.0 * y + 0.1 * x * x + 0.1 * x * y + 0.1 * math.sqrt(abs(x))
+    ret += (20.0 * math.sin(6.0 * x * math.pi) + 20.0 * math.sin(2.0 * x * math.pi)) * 2.0 / 3.0
+    ret += (20.0 * math.sin(x * math.pi) + 40.0 * math.sin(x / 3.0 * math.pi)) * 2.0 / 3.0
+    ret += (150.0 * math.sin(x / 12.0 * math.pi) + 300.0 * math.sin(x / 30.0 * math.pi)) * 2.0 / 3.0
+    return ret
+
+
+def wgs84_to_gcj02(lng, lat):
+    """WGS-84 → GCJ-02（正向加密，用于展示/反推，非本程序主用途）"""
+    if _out_of_china(lng, lat):
+        return lng, lat
+    dlat = _transform_lat(lng - 105.0, lat - 35.0)
+    dlng = _transform_lon(lng - 105.0, lat - 35.0)
+    radlat = lat / 180.0 * math.pi
+    magic = math.sin(radlat)
+    magic = 1 - 0.00669342162296594323 * magic * magic
+    sqrtmagic = math.sqrt(magic)
+    dlat = (dlat * 180.0) / ((6378245.0 * (1 - 0.00669342162296594323)) / (magic * sqrtmagic) * math.pi)
+    dlng = (dlng * 180.0) / (6378245.0 / sqrtmagic * math.cos(radlat) * math.pi)
+    return lng + dlng, lat + dlat
+
+
+def gcj02_to_wgs84(lng, lat):
+    """GCJ-02 → WGS-84（逆向解密，迭代近似，误差 < 1e-6 度）"""
+    if _out_of_china(lng, lat):
+        return lng, lat
+    # 逆向无解析解，用迭代法：反复用正向变换修正估计值，直到收敛
+    wgs_lng, wgs_lat = lng, lat
+    for _ in range(10):
+        g_lng, g_lat = wgs84_to_gcj02(wgs_lng, wgs_lat)
+        d_lng = g_lng - lng
+        d_lat = g_lat - lat
+        if abs(d_lng) < 1e-9 and abs(d_lat) < 1e-9:
+            break
+        wgs_lng -= d_lng
+        wgs_lat -= d_lat
+    return wgs_lng, wgs_lat
+
+
+def _location_to_wgs84(location):
+    """把高德返回的 GCJ-02 location 字符串「经度,纬度」转成 WGS-84 (lon, lat)"""
+    if not location:
+        return None, None
+    parts = location.split(",")
+    if len(parts) < 2:
+        return None, None
+    lon, lat = gcj02_to_wgs84(float(parts[0]), float(parts[1]))
+    return lon, lat
+
+
+def utm_epsg_for(lons):
+    """按数据中心经度自动选择 UTM 分带（北半球），返回如 'EPSG:32650'。
+
+    米制量算（离散度、密度分箱等）必须先投影：1° 经度的实际长度随纬度
+    变化（cos φ），直接对「度」做距离比较会失真。数据都在一个城市尺度，
+    落在同一分带内，按中心经度选带即可。
+    """
+    lons = [float(x) for x in lons if pd.notna(x)]
+    zone = int((sum(lons) / len(lons) + 180) // 6) + 1
+    return f"EPSG:{32600 + zone}"
 
 
 # ============ 2. 核心：封装 POI 搜索函数 ============
@@ -60,6 +154,7 @@ def search_poi(keywords, city=CITY, api_key=API_KEY, page_size=20):
 
     返回:
         pandas.DataFrame，含 名称/地址/经度/纬度/类型/行政区划 等列
+        （经纬度已从 GCJ-02 纠偏为 WGS-84）
     """
     params = {
         "key": api_key,
@@ -83,11 +178,10 @@ def search_poi(keywords, city=CITY, api_key=API_KEY, page_size=20):
             print(f"✗ API 返回错误: {data.get('info', '未知错误')}")
             return pd.DataFrame()
 
-        # 逐条提取有用字段
+        # 逐条提取有用字段（坐标在此完成 GCJ-02 → WGS-84 纠偏）
         rows = []
         for poi in data["pois"]:
-            location = poi.get("location", "")
-            lon, lat = (location.split(",") + [None, None])[:2] if location else (None, None)
+            lon, lat = _location_to_wgs84(poi.get("location", ""))
 
             rows.append({
                 "名称": poi.get("name"),
@@ -113,7 +207,7 @@ def search_poi(keywords, city=CITY, api_key=API_KEY, page_size=20):
 # ============ 3. 分页搜索（获取更多数据） ============
 
 def search_poi_with_pagination(keywords, city=CITY, api_key=API_KEY, max_count=100):
-    """分页获取更多 POI（高德默认每页 20 条，单次最多 50 条）"""
+    """分页获取更多 POI（高德默认每页 20 条，单次最多 50 条；坐标已纠偏为 WGS-84）"""
     all_pois = []
     page, page_size = 1, 50
 
@@ -149,8 +243,7 @@ def search_poi_with_pagination(keywords, city=CITY, api_key=API_KEY, max_count=1
 
     rows = []
     for poi in all_pois[:max_count]:
-        location = poi.get("location", "")
-        lon, lat = (location.split(",") + [None, None])[:2] if location else (None, None)
+        lon, lat = _location_to_wgs84(poi.get("location", ""))
         rows.append({
             "名称": poi.get("name"),
             "地址": poi.get("address"),
@@ -167,7 +260,7 @@ def search_poi_in_district(keywords, district=DISTRICT, city=CITY, api_key=API_K
     在指定区县搜索 POI（例如「北京东城区」的博物馆）
 
     返回:
-        pandas.DataFrame
+        pandas.DataFrame（经纬度已从 GCJ-02 纠偏为 WGS-84）
     """
     params = {
         "key": api_key,
@@ -186,8 +279,7 @@ def search_poi_in_district(keywords, district=DISTRICT, city=CITY, api_key=API_K
 
         rows = []
         for poi in data["pois"]:
-            location = poi.get("location", "")
-            lon, lat = (location.split(",") + [None, None])[:2] if location else (None, None)
+            lon, lat = _location_to_wgs84(poi.get("location", ""))
             rows.append({
                 "名称": poi.get("name"),
                 "地址": poi.get("address"),
@@ -331,7 +423,7 @@ if __name__ == "__main__":
     # ============ 7. 重点对象深入分析（geopandas + matplotlib） ============
 
     def to_gdf(df):
-        """把含 经度/纬度 的 DataFrame 转成 GeoDataFrame，自动剔除无效坐标"""
+        """把含 经度/纬度 的 DataFrame 转成 GeoDataFrame，自动剔除无效坐标（坐标已纠偏为 WGS-84）"""
         d = df.copy()
         d["经度"] = pd.to_numeric(d["经度"], errors="coerce")
         d["纬度"] = pd.to_numeric(d["纬度"], errors="coerce")
@@ -339,7 +431,7 @@ if __name__ == "__main__":
         return gpd.GeoDataFrame(
             d,
             geometry=[Point(x, y) for x, y in zip(d["经度"], d["纬度"])],
-            crs="EPSG:4326",
+            crs="EPSG:4326",   # 坐标已从 GCJ-02 纠偏为 WGS-84，此声明正确
         )
 
     focus_gdf = to_gdf(focus) if not focus.empty else gpd.GeoDataFrame()
@@ -379,13 +471,17 @@ if __name__ == "__main__":
             print(f"  {district}: {count} 家 ({count / len(focus) * 100:.1f}%)")
 
         # 7.3 密度热力图
+        # 先投影到 UTM：按「度」分箱时东西向格宽随 cosφ 变窄（南京约 15%），
+        # 每格地面面积不等；投影后分箱，各格面积相等，密度才有可比性
         fig, ax = plt.subplots(figsize=(12, 10))
-        h = ax.hist2d(focus_gdf.geometry.x, focus_gdf.geometry.y, bins=30, cmap="YlOrRd", cmin=1)
+        utm_epsg = utm_epsg_for(pd.to_numeric(focus["经度"], errors="coerce").dropna())
+        focus_utm = focus_gdf.to_crs(utm_epsg)
+        h = ax.hist2d(focus_utm.geometry.x, focus_utm.geometry.y, bins=30, cmap="YlOrRd", cmin=1)
         cbar = plt.colorbar(h[3], ax=ax)
         cbar.set_label(f"{FOCUS_POI}数量", fontsize=11)
-        ax.set_xlabel("经度", fontsize=12)
-        ax.set_ylabel("纬度", fontsize=12)
-        ax.set_title(f"{CITY}市{FOCUS_POI}密度热力图", fontsize=14, fontweight="bold")
+        ax.set_xlabel(f"X（米，{utm_epsg}）", fontsize=12)
+        ax.set_ylabel(f"Y（米，{utm_epsg}）", fontsize=12)
+        ax.set_title(f"{CITY}市{FOCUS_POI}密度热力图（UTM 米制分箱）", fontsize=14, fontweight="bold")
         ax.grid(True, alpha=0.3)
         plt.tight_layout()
         plt.savefig(f"data/{FOCUS_POI}_density_heatmap.png", dpi=300, bbox_inches="tight")
@@ -395,22 +491,34 @@ if __name__ == "__main__":
     # ============ 8. 空间分布特征对比 ============
 
     def analyze_distribution(df, name):
-        """计算 POI 的空间分布特征（中心点 / 离散度 / 范围）"""
+        """计算 POI 的空间分布特征（中心点 / 离散度 / 范围）。
+
+        离散度与范围必须用米制坐标量算：1° 经度的实际长度随纬度变化
+        （cos φ），直接对「度」求标准差会把东西向离散系统性低估约 15%，
+        故先投影到 UTM（按数据中心经度自动选择分带）再计算。
+        """
         if df.empty:
             return None
         lons = pd.to_numeric(df["经度"], errors="coerce").dropna()
         lats = pd.to_numeric(df["纬度"], errors="coerce").dropna()
         if lons.empty:
             return None
+        utm_epsg = utm_epsg_for(lons)
+        g = gpd.GeoDataFrame(
+            geometry=[Point(x, y) for x, y in zip(lons, lats)],
+            crs="EPSG:4326",
+        ).to_crs(utm_epsg)
+        xs, ys = g.geometry.x, g.geometry.y
         return {
             "名称": name,
             "数量": len(df),
             "中心经度": round(lons.mean(), 4),
             "中心纬度": round(lats.mean(), 4),
-            "经度离散度": round(lons.std(), 4),
-            "纬度离散度": round(lats.std(), 4),
-            "经度范围": round(lons.max() - lons.min(), 4),
-            "纬度范围": round(lats.max() - lats.min(), 4),
+            "东西离散度_米": round(xs.std(), 0),
+            "南北离散度_米": round(ys.std(), 0),
+            "东西跨度_米": round(xs.max() - xs.min(), 0),
+            "南北跨度_米": round(ys.max() - ys.min(), 0),
+            "投影": utm_epsg,
         }
 
     spatial_stats = []
@@ -421,22 +529,22 @@ if __name__ == "__main__":
 
     if spatial_stats:
         stats_df = pd.DataFrame(spatial_stats)
-        print("\n空间分布特征对比:")
+        print("\n空间分布特征对比（离散度/跨度单位为米，投影: " + stats_df["投影"].iloc[0] + "）:")
         print(stats_df.to_string(index=False))
 
         fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 6))
 
-        ax1.bar(stats_df["名称"], stats_df["经度离散度"], color="skyblue", edgecolor="black")
+        ax1.bar(stats_df["名称"], stats_df["东西离散度_米"], color="skyblue", edgecolor="black")
         ax1.set_xlabel("POI类型", fontsize=12)
-        ax1.set_ylabel("经度离散度", fontsize=12)
-        ax1.set_title("东西方向分布离散度", fontsize=13, fontweight="bold")
+        ax1.set_ylabel("东西向离散度（米）", fontsize=12)
+        ax1.set_title("东西方向分布离散度（投影后米制）", fontsize=13, fontweight="bold")
         ax1.grid(axis="y", alpha=0.3)
         plt.setp(ax1.xaxis.get_majorticklabels(), rotation=45, ha="right")
 
-        ax2.bar(stats_df["名称"], stats_df["纬度离散度"], color="lightcoral", edgecolor="black")
+        ax2.bar(stats_df["名称"], stats_df["南北离散度_米"], color="lightcoral", edgecolor="black")
         ax2.set_xlabel("POI类型", fontsize=12)
-        ax2.set_ylabel("纬度离散度", fontsize=12)
-        ax2.set_title("南北方向分布离散度", fontsize=13, fontweight="bold")
+        ax2.set_ylabel("南北向离散度（米）", fontsize=12)
+        ax2.set_title("南北方向分布离散度（投影后米制）", fontsize=13, fontweight="bold")
         ax2.grid(axis="y", alpha=0.3)
         plt.setp(ax2.xaxis.get_majorticklabels(), rotation=45, ha="right")
 
@@ -462,6 +570,9 @@ if __name__ == "__main__":
         print(f"✓ {DISTRICT}博物馆地图已生成: data/{DISTRICT}_museums_map.html")
 
     # ============ 10. 投影坐标系转换（EPSG:3857 Web墨卡托） ============
+    # 注意：Web墨卡托是「显示用」投影，与在线底图（Google/OSM/高德）对齐方便，
+    # 但距离在高纬度被放大（1/cosφ，南京约 +18%），其 X/Y(米) 不能用于距离量算。
+    # 需要米制量算时请改用 UTM（本程序第 7.3、8 节的统计即采用 UTM）。
 
     print("\n【投影坐标系转换】WGS84 → EPSG:3857 (Web墨卡托)")
     print("-" * 50)
@@ -490,6 +601,9 @@ if __name__ == "__main__":
         out["Y(米)"] = all_3857.geometry.y.round(2)
         out.to_csv("data/POI_EPSG3857投影.csv", index=False, encoding="utf-8-sig")
         print("✓ 投影后数据已保存: data/POI_EPSG3857投影.csv")
+        print("⚠ 提示: EPSG:3857 (Web墨卡托) 仅用于与在线底图对齐的显示，")
+        print("   其距离在南京纬度(约32°N)被放大约 1/cos32° ≈ 18%，X/Y(米) 不能用于距离量算；")
+        print("   需要量算时请改用 UTM（本程序第 7.3、8 节的米制统计即采用 UTM）。")
 
         # 用投影坐标绘制地图（x/y 单位为米，不再是经纬度）
         color_map = COLORS
