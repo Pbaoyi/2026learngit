@@ -13,7 +13,7 @@ import requests
 from shapely.geometry import Point
 
 # %% 1. 配置
-API_KEY = 'xxxxx'
+API_KEY = 'xxxxxxxx'
 BASE_URL = 'https://restapi.amap.com/v5/place/text'
 
 CITY_NAME = '无锡'
