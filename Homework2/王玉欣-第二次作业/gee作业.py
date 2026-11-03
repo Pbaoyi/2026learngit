@@ -18,16 +18,30 @@ def mask_clouds(image):     # 剔除云的影响
     return image.updateMask(mask).divide(10000)
 
 composite = s2.map(mask_clouds).median().clip(roi)
-'''
-对筛选出的多景影像应用去云函数，然后取中位数（median）进行合成。
-   这能有效填补残余的云层空洞，生成一张干净、无云的年度合成影像，
-   并裁剪到研究区范围内
-'''
+
+#%%
 ndvi = composite.normalizedDifference(['B8', 'B4']).rename('NDVI')
 '''
 利用 Sentinel-2 的 B8（近红外波段）和 B4（红光波段） 
     计算归一化植被指数（NDVI）
 '''
+geemap.download_ee_image(
+    image=ndvi,
+    filename=r"C:\Users\王玉欣\Desktop\nanjing_ndvi_2024.tif",  # 桌面路径
+    region=roi,
+    scale=100,            #图太大上传不到GitHub，分辨率调小了
+    crs='EPSG:4326',
+    max_tile_size=16,    # 调小瓦片防溢出
+    max_tile_dim=500,
+    num_threads=20
+)
+print('下载完成！文件在桌面：nanjing_ndvi_2024.tif')
+'''
+对筛选出的多景影像应用去云函数，然后取中位数（median）进行合成。
+   这能有效填补残余的云层空洞，生成一张干净、无云的年度合成影像，
+   并裁剪到研究区范围内
+'''
+
 #%%
 m = geemap.Map() # 调用 geemap 库创建一个交互式地图
 m.centerObject(roi, 10) # 将地图视角居中到研究区，缩放级别为 10
